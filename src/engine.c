@@ -75,6 +75,7 @@ typedef struct container_record {
     int exit_code;
     int exit_signal;
     char log_path[PATH_MAX];
+    int stop_requested;
     struct container_record *next;
 } container_record_t;
 
@@ -415,10 +416,52 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
 }
 
 volatile sig_atomic_t child_exited_flag = 0;
+volatile sig_atomic_t supervisor_stop_flag = 0;
 
 static void sigchld_handler(int signum) {
     (void)signum;
     child_exited_flag = 1;
+}
+
+static void supervisor_sigint_handler(int signum) {
+    (void)signum;
+    supervisor_stop_flag = 1;
+}
+
+static void reap_children(supervisor_ctx_t *ctx) {
+    if (child_exited_flag) {
+        child_exited_flag = 0;
+        int status;
+        pid_t pid;
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            pthread_mutex_lock(&ctx->metadata_lock);
+            container_record_t *curr = ctx->containers;
+            while (curr) {
+                if (curr->host_pid == pid) {
+                    if (WIFEXITED(status)) {
+                        if (curr->stop_requested) {
+                            curr->state = CONTAINER_STOPPED;
+                        } else {
+                            curr->state = CONTAINER_EXITED;
+                        }
+                        curr->exit_code = WEXITSTATUS(status);
+                        printf("Container %s exited/stopped with code %d\n", curr->id, curr->exit_code);
+                    } else if (WIFSIGNALED(status)) {
+                        if (curr->stop_requested) {
+                            curr->state = CONTAINER_STOPPED;
+                        } else {
+                            curr->state = CONTAINER_KILLED;
+                        }
+                        curr->exit_signal = WTERMSIG(status);
+                        printf("Container %s killed/stopped by signal %d\n", curr->id, curr->exit_signal);
+                    }
+                    break;
+                }
+                curr = curr->next;
+            }
+            pthread_mutex_unlock(&ctx->metadata_lock);
+        }
+    }
 }
 
 static int spawn_container(supervisor_ctx_t *ctx, child_config_t *config)
@@ -443,7 +486,7 @@ static int spawn_container(supervisor_ctx_t *ctx, child_config_t *config)
         return -1;
     }
 
-    strncpy(record->id, config->id, sizeof(record->id) - 1);
+    snprintf(record->id, sizeof(record->id), "%s", config->id);
     record->host_pid = pid;
     record->started_at = time(NULL);
     record->state = CONTAINER_RUNNING;
@@ -456,17 +499,170 @@ static int spawn_container(supervisor_ctx_t *ctx, child_config_t *config)
     return 0;
 }
 
-/*
- * TODO:
- * Implement the long-running supervisor process.
- *
- * Suggested responsibilities:
- *   - create and bind the control-plane IPC endpoint
- *   - initialize shared metadata and the bounded buffer
- *   - start the logging thread
- *   - accept control requests and update container state
- *   - reap children and respond to signals
- */
+typedef struct {
+    int client_fd;
+    supervisor_ctx_t *ctx;
+} client_handler_args_t;
+
+void *client_handler_thread_fn(void *arg) {
+    client_handler_args_t *args = (client_handler_args_t *)arg;
+    int client_fd = args->client_fd;
+    supervisor_ctx_t *ctx = args->ctx;
+    free(args);
+
+    control_request_t req;
+    if (recv(client_fd, &req, sizeof(req), MSG_WAITALL) != sizeof(req)) {
+        close(client_fd);
+        return NULL;
+    }
+
+    control_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+
+    if (req.kind == CMD_START || req.kind == CMD_RUN) {
+        child_config_t config;
+        memset(&config, 0, sizeof(config));
+        snprintf(config.id, sizeof(config.id), "%s", req.container_id);
+        snprintf(config.rootfs, sizeof(config.rootfs), "%s", req.rootfs);
+        snprintf(config.command, sizeof(config.command), "%s", req.command);
+        config.nice_value = req.nice_value;
+
+        if (spawn_container(ctx, &config) < 0) {
+            resp.status = 1;
+            snprintf(resp.message, sizeof(resp.message), "Failed to spawn container");
+            send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+            close(client_fd);
+            return NULL;
+        }
+
+        if (req.kind == CMD_START) {
+            resp.status = 0;
+            snprintf(resp.message, sizeof(resp.message), "Container %s started", req.container_id);
+            send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+            close(client_fd);
+            return NULL;
+        }
+
+        if (req.kind == CMD_RUN) {
+            int exit_status = 1;
+            while (!ctx->should_stop && !supervisor_stop_flag) {
+                pthread_mutex_lock(&ctx->metadata_lock);
+                container_record_t *curr = ctx->containers;
+                int found = 0;
+                while (curr) {
+                    if (strcmp(curr->id, req.container_id) == 0) {
+                        found = 1;
+                        if (curr->state == CONTAINER_EXITED) {
+                            exit_status = curr->exit_code;
+                            found = 2;
+                        } else if (curr->state == CONTAINER_KILLED || curr->state == CONTAINER_STOPPED) {
+                            exit_status = 128 + curr->exit_signal;
+                            found = 2;
+                        }
+                        break;
+                    }
+                    curr = curr->next;
+                }
+                pthread_mutex_unlock(&ctx->metadata_lock);
+
+                if (found == 2 || found == 0) {
+                    break;
+                }
+                usleep(100000);
+            }
+            resp.status = exit_status;
+            send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+            close(client_fd);
+            return NULL;
+        }
+    } else if (req.kind == CMD_STOP) {
+        pthread_mutex_lock(&ctx->metadata_lock);
+        container_record_t *curr = ctx->containers;
+        int found = 0;
+        while (curr) {
+            if (strcmp(curr->id, req.container_id) == 0) {
+                found = 1;
+                if (curr->state == CONTAINER_RUNNING || curr->state == CONTAINER_STARTING) {
+                    curr->stop_requested = 1;
+                    kill(curr->host_pid, SIGKILL);
+                    resp.status = 0;
+                    snprintf(resp.message, sizeof(resp.message), "Container %s stopped", req.container_id);
+                } else {
+                    resp.status = 1;
+                    snprintf(resp.message, sizeof(resp.message), "Container %s not running", req.container_id);
+                }
+                break;
+            }
+            curr = curr->next;
+        }
+        pthread_mutex_unlock(&ctx->metadata_lock);
+
+        if (!found) {
+            resp.status = 1;
+            snprintf(resp.message, sizeof(resp.message), "Container %s not found", req.container_id);
+        }
+        send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+    } else if (req.kind == CMD_PS) {
+        resp.status = 0;
+        send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+
+        char buf[1024];
+        pthread_mutex_lock(&ctx->metadata_lock);
+        container_record_t *curr = ctx->containers;
+        snprintf(buf, sizeof(buf), "%-16s %-8s %-16s %-8s\n", "CONTAINER ID", "PID", "STATE", "EXIT CODE");
+        send(client_fd, buf, strlen(buf), MSG_NOSIGNAL);
+        while (curr) {
+            snprintf(buf, sizeof(buf), "%-16s %-8d %-16s %-8d\n",
+                     curr->id, curr->host_pid, state_to_string(curr->state),
+                     (curr->state == CONTAINER_EXITED) ? curr->exit_code : 
+                     ((curr->state == CONTAINER_KILLED || curr->state == CONTAINER_STOPPED) ? curr->exit_signal : 0));
+            send(client_fd, buf, strlen(buf), MSG_NOSIGNAL);
+            curr = curr->next;
+        }
+        pthread_mutex_unlock(&ctx->metadata_lock);
+    } else if (req.kind == CMD_LOGS) {
+        resp.status = 0;
+        send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        
+        char log_path[PATH_MAX];
+        snprintf(log_path, sizeof(log_path), "%s/%s.log", LOG_DIR, req.container_id);
+        int fd = open(log_path, O_RDONLY);
+        if (fd >= 0) {
+            char buf[1024];
+            ssize_t n;
+            while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                send(client_fd, buf, n, MSG_NOSIGNAL);
+            }
+            close(fd);
+        } else {
+            char *msg = "No logs found.\n";
+            send(client_fd, msg, strlen(msg), MSG_NOSIGNAL);
+        }
+    }
+
+    close(client_fd);
+    return NULL;
+}
+
+void *ipc_server_thread_fn(void *arg) {
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    while (!ctx->should_stop && !supervisor_stop_flag) {
+        int client_fd = accept(ctx->server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
+            break;
+        }
+        pthread_t tid;
+        client_handler_args_t *args = malloc(sizeof(client_handler_args_t));
+        args->client_fd = client_fd;
+        args->ctx = ctx;
+        pthread_create(&tid, NULL, client_handler_thread_fn, args);
+        pthread_detach(tid);
+    }
+    return NULL;
+}
+
 static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
@@ -500,66 +696,168 @@ static int run_supervisor(const char *rootfs)
         return 1;
     }
 
-    child_config_t test_config;
-    memset(&test_config, 0, sizeof(test_config));
-    strncpy(test_config.id, "alpha", sizeof(test_config.id) - 1);
-    strncpy(test_config.rootfs, rootfs, sizeof(test_config.rootfs) - 1);
-    strncpy(test_config.command, "/bin/sleep 5", sizeof(test_config.command) - 1);
-
-    printf("Spawning hardcoded container 'alpha'...\n");
-    if (spawn_container(&ctx, &test_config) < 0) {
-        fprintf(stderr, "Failed to spawn hardcoded container\n");
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = supervisor_sigint_handler;
+    sa.sa_flags = 0;
+    if (sigaction(SIGINT, &sa, NULL) == -1 || sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 1;
     }
 
-    printf("Supervisor running...\n");
-    while (!ctx.should_stop) {
-        if (child_exited_flag) {
-            child_exited_flag = 0;
-            int status;
-            pid_t pid;
-            while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-                pthread_mutex_lock(&ctx.metadata_lock);
-                container_record_t *curr = ctx.containers;
-                while (curr) {
-                    if (curr->host_pid == pid) {
-                        if (WIFEXITED(status)) {
-                            curr->state = CONTAINER_EXITED;
-                            curr->exit_code = WEXITSTATUS(status);
-                            printf("Container %s exited with code %d\n", curr->id, curr->exit_code);
-                        } else if (WIFSIGNALED(status)) {
-                            curr->state = CONTAINER_KILLED;
-                            curr->exit_signal = WTERMSIG(status);
-                            printf("Container %s killed by signal %d\n", curr->id, curr->exit_signal);
-                        }
-                        break;
-                    }
-                    curr = curr->next;
-                }
-                pthread_mutex_unlock(&ctx.metadata_lock);
-            }
-        }
+    mkdir(LOG_DIR, 0755);
+
+    ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctx.server_fd < 0) {
+        perror("socket");
+        return 1;
+    }
+    unlink(CONTROL_PATH);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+    if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+    if (listen(ctx.server_fd, 10) < 0) {
+        perror("listen");
+        return 1;
+    }
+
+    pthread_t ipc_tid;
+    pthread_create(&ipc_tid, NULL, ipc_server_thread_fn, &ctx);
+
+    fprintf(stderr, "Supervisor started for base-rootfs: %s\n", rootfs);
+
+    while (!ctx.should_stop && !supervisor_stop_flag) {
+        reap_children(&ctx);
         sleep(1);
     }
+
+    printf("\nSupervisor shutting down. Stopping all containers...\n");
+    pthread_mutex_lock(&ctx.metadata_lock);
+    container_record_t *curr = ctx.containers;
+    while (curr) {
+        if (curr->state == CONTAINER_RUNNING || curr->state == CONTAINER_STARTING) {
+            curr->stop_requested = 1;
+            kill(curr->host_pid, SIGKILL);
+        }
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&ctx.metadata_lock);
+
+    int running_count = 1;
+    while (running_count > 0) {
+        reap_children(&ctx);
+        running_count = 0;
+        pthread_mutex_lock(&ctx.metadata_lock);
+        curr = ctx.containers;
+        while (curr) {
+            if (curr->state == CONTAINER_RUNNING || curr->state == CONTAINER_STARTING) {
+                running_count++;
+            }
+            curr = curr->next;
+        }
+        pthread_mutex_unlock(&ctx.metadata_lock);
+        if (running_count > 0) usleep(100000);
+    }
+
+    close(ctx.server_fd);
+    unlink(CONTROL_PATH);
+    pthread_cancel(ipc_tid);
+    pthread_join(ipc_tid, NULL);
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
-    return 1;
+    return 0;
 }
 
-/*
- * TODO:
- * Implement the client-side control request path.
- *
- * The CLI commands should use a second IPC mechanism distinct from the
- * logging pipe. A UNIX domain socket is the most direct option, but a
- * FIFO or shared memory design is also acceptable if justified.
- */
+static char run_container_id[CONTAINER_ID_LEN];
+
+static void client_sigint_handler(int signum) {
+    (void)signum;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            control_request_t req;
+            memset(&req, 0, sizeof(req));
+            req.kind = CMD_STOP;
+            snprintf(req.container_id, sizeof(req.container_id), "%s", run_container_id);
+            send(fd, &req, sizeof(req), MSG_NOSIGNAL);
+        }
+        close(fd);
+    }
+}
+
 static int send_control_request(const control_request_t *req)
 {
-    (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
-    return 1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect to supervisor");
+        close(fd);
+        return 1;
+    }
+
+    if (send(fd, req, sizeof(*req), MSG_NOSIGNAL) != sizeof(*req)) {
+        perror("send");
+        close(fd);
+        return 1;
+    }
+
+    if (req->kind == CMD_RUN) {
+        snprintf(run_container_id, sizeof(run_container_id), "%s", req->container_id);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = client_sigint_handler;
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
+
+    control_response_t resp;
+    ssize_t n;
+    while ((n = recv(fd, &resp, sizeof(resp), MSG_WAITALL)) < 0) {
+        if (errno == EINTR) continue;
+        break;
+    }
+    
+    if (n < (ssize_t)sizeof(resp)) {
+        fprintf(stderr, "Invalid response from supervisor\n");
+        close(fd);
+        return 1;
+    }
+
+    if (resp.message[0] != '\0') {
+        printf("%s\n", resp.message);
+    }
+
+    if (req->kind == CMD_PS || req->kind == CMD_LOGS) {
+        char buf[1024];
+        while ((n = recv(fd, buf, sizeof(buf) - 1, 0)) > 0) {
+            buf[n] = '\0';
+            printf("%s", buf);
+        }
+    }
+
+    int status = resp.status;
+    close(fd);
+    return status;
 }
 
 static int cmd_start(int argc, char *argv[])
@@ -619,17 +917,6 @@ static int cmd_ps(void)
     memset(&req, 0, sizeof(req));
     req.kind = CMD_PS;
 
-    /*
-     * TODO:
-     * The supervisor should respond with container metadata.
-     * Keep the rendering format simple enough for demos and debugging.
-     */
-    printf("Expected states include: %s, %s, %s, %s, %s\n",
-           state_to_string(CONTAINER_STARTING),
-           state_to_string(CONTAINER_RUNNING),
-           state_to_string(CONTAINER_STOPPED),
-           state_to_string(CONTAINER_KILLED),
-           state_to_string(CONTAINER_EXITED));
     return send_control_request(&req);
 }
 
