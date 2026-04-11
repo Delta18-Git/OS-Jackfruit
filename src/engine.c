@@ -338,7 +338,45 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *config = (child_config_t *)arg;
+
+    if (mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL) != 0) {
+        perror("mount private");
+        return 1;
+    }
+
+    if (chroot(config->rootfs) != 0) {
+        perror("chroot");
+        return 1;
+    }
+    if (chdir("/") != 0) {
+        perror("chdir");
+        return 1;
+    }
+
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        perror("mount proc");
+        return 1;
+    }
+
+    char *argv[64];
+    int argc = 0;
+    char *cmd_copy = strdup(config->command);
+    if (!cmd_copy) {
+        perror("strdup");
+        return 1;
+    }
+
+    char *token = strtok(cmd_copy, " ");
+    while (token != NULL && argc < 63) {
+        argv[argc++] = token;
+        token = strtok(NULL, " ");
+    }
+    argv[argc] = NULL;
+
+    execvp(argv[0], argv);
+    perror("execvp");
+    free(cmd_copy);
     return 1;
 }
 
@@ -372,6 +410,48 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
 
     if (ioctl(monitor_fd, MONITOR_UNREGISTER, &req) < 0)
         return -1;
+
+    return 0;
+}
+
+volatile sig_atomic_t child_exited_flag = 0;
+
+static void sigchld_handler(int signum) {
+    (void)signum;
+    child_exited_flag = 1;
+}
+
+static int spawn_container(supervisor_ctx_t *ctx, child_config_t *config)
+{
+    void *stack = malloc(STACK_SIZE);
+    if (!stack) {
+        perror("malloc stack");
+        return -1;
+    }
+
+    int clone_flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+    pid_t pid = clone(child_fn, (char *)stack + STACK_SIZE, clone_flags, config);
+    if (pid < 0) {
+        perror("clone");
+        free(stack);
+        return -1;
+    }
+
+    container_record_t *record = calloc(1, sizeof(container_record_t));
+    if (!record) {
+        perror("calloc record");
+        return -1;
+    }
+
+    strncpy(record->id, config->id, sizeof(record->id) - 1);
+    record->host_pid = pid;
+    record->started_at = time(NULL);
+    record->state = CONTAINER_RUNNING;
+
+    pthread_mutex_lock(&ctx->metadata_lock);
+    record->next = ctx->containers;
+    ctx->containers = record;
+    pthread_mutex_unlock(&ctx->metadata_lock);
 
     return 0;
 }
@@ -411,15 +491,55 @@ static int run_supervisor(const char *rootfs)
         return 1;
     }
 
-    /*
-     * TODO:
-     *   1) open /dev/container_monitor
-     *   2) create the control socket / FIFO / shared-memory channel
-     *   3) install SIGCHLD / SIGINT / SIGTERM handling
-     *   4) spawn the logger thread
-     *   5) enter the supervisor event loop
-     */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 1;
+    }
+
+    child_config_t test_config;
+    memset(&test_config, 0, sizeof(test_config));
+    strncpy(test_config.id, "alpha", sizeof(test_config.id) - 1);
+    strncpy(test_config.rootfs, rootfs, sizeof(test_config.rootfs) - 1);
+    strncpy(test_config.command, "/bin/sleep 5", sizeof(test_config.command) - 1);
+
+    printf("Spawning hardcoded container 'alpha'...\n");
+    if (spawn_container(&ctx, &test_config) < 0) {
+        fprintf(stderr, "Failed to spawn hardcoded container\n");
+    }
+
+    printf("Supervisor running...\n");
+    while (!ctx.should_stop) {
+        if (child_exited_flag) {
+            child_exited_flag = 0;
+            int status;
+            pid_t pid;
+            while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+                pthread_mutex_lock(&ctx.metadata_lock);
+                container_record_t *curr = ctx.containers;
+                while (curr) {
+                    if (curr->host_pid == pid) {
+                        if (WIFEXITED(status)) {
+                            curr->state = CONTAINER_EXITED;
+                            curr->exit_code = WEXITSTATUS(status);
+                            printf("Container %s exited with code %d\n", curr->id, curr->exit_code);
+                        } else if (WIFSIGNALED(status)) {
+                            curr->state = CONTAINER_KILLED;
+                            curr->exit_signal = WTERMSIG(status);
+                            printf("Container %s killed by signal %d\n", curr->id, curr->exit_signal);
+                        }
+                        break;
+                    }
+                    curr = curr->next;
+                }
+                pthread_mutex_unlock(&ctx.metadata_lock);
+            }
+        }
+        sleep(1);
+    }
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
