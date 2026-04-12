@@ -117,6 +117,8 @@ typedef struct {
     char command[CHILD_COMMAND_LEN];
     int nice_value;
     int log_write_fd;
+    unsigned long soft_limit_bytes;
+    unsigned long hard_limit_bytes;
 } child_config_t;
 
 typedef struct {
@@ -470,7 +472,7 @@ int register_with_monitor(int monitor_fd,
     req.pid = host_pid;
     req.soft_limit_bytes = soft_limit_bytes;
     req.hard_limit_bytes = hard_limit_bytes;
-    strncpy(req.container_id, container_id, sizeof(req.container_id) - 1);
+    snprintf(req.container_id, sizeof(req.container_id), "%s", container_id);
 
     if (ioctl(monitor_fd, MONITOR_REGISTER, &req) < 0)
         return -1;
@@ -484,7 +486,7 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
 
     memset(&req, 0, sizeof(req));
     req.pid = host_pid;
-    strncpy(req.container_id, container_id, sizeof(req.container_id) - 1);
+    snprintf(req.container_id, sizeof(req.container_id), "%s", container_id);
 
     if (ioctl(monitor_fd, MONITOR_UNREGISTER, &req) < 0)
         return -1;
@@ -511,6 +513,9 @@ static void reap_children(supervisor_ctx_t *ctx) {
         int status;
         pid_t pid;
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            char exited_id[CONTAINER_ID_LEN] = {0};
+            int should_unregister = 0;
+
             pthread_mutex_lock(&ctx->metadata_lock);
             container_record_t *curr = ctx->containers;
             while (curr) {
@@ -532,11 +537,17 @@ static void reap_children(supervisor_ctx_t *ctx) {
                         curr->exit_signal = WTERMSIG(status);
                         printf("Container %s killed/stopped by signal %d\n", curr->id, curr->exit_signal);
                     }
+                    snprintf(exited_id, sizeof(exited_id), "%s", curr->id);
+                    should_unregister = 1;
                     break;
                 }
                 curr = curr->next;
             }
             pthread_mutex_unlock(&ctx->metadata_lock);
+
+            if (should_unregister && ctx->monitor_fd >= 0) {
+                unregister_from_monitor(ctx->monitor_fd, exited_id, pid);
+            }
         }
     }
 }
@@ -603,6 +614,15 @@ static int spawn_container(supervisor_ctx_t *ctx, child_config_t *config)
     ctx->containers = record;
     pthread_mutex_unlock(&ctx->metadata_lock);
 
+    record->soft_limit_bytes = config->soft_limit_bytes;
+    record->hard_limit_bytes = config->hard_limit_bytes;
+
+    if (ctx->monitor_fd >= 0) {
+        register_with_monitor(ctx->monitor_fd, record->id, pid,
+                              config->soft_limit_bytes,
+                              config->hard_limit_bytes);
+    }
+
     return 0;
 }
 
@@ -633,6 +653,8 @@ void *client_handler_thread_fn(void *arg) {
         snprintf(config.rootfs, sizeof(config.rootfs), "%s", req.rootfs);
         snprintf(config.command, sizeof(config.command), "%s", req.command);
         config.nice_value = req.nice_value;
+        config.soft_limit_bytes = req.soft_limit_bytes;
+        config.hard_limit_bytes = req.hard_limit_bytes;
 
         if (spawn_container(ctx, &config) < 0) {
             resp.status = 1;
@@ -832,6 +854,11 @@ static int run_supervisor(const char *rootfs)
         return 1;
     }
 
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0) {
+        perror("open /dev/container_monitor");
+    }
+
     pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
 
     pthread_t ipc_tid;
@@ -873,6 +900,8 @@ static int run_supervisor(const char *rootfs)
     }
 
     close(ctx.server_fd);
+    if (ctx.monitor_fd >= 0)
+        close(ctx.monitor_fd);
     unlink(CONTROL_PATH);
     pthread_cancel(ipc_tid);
     pthread_join(ipc_tid, NULL);
