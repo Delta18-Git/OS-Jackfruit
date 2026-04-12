@@ -300,8 +300,7 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
 }
 
 /*
- * TODO:
- * Implement producer-side insertion into the bounded buffer.
+ * Producer-side insertion into the bounded buffer.
  *
  * Requirements:
  *   - block or fail according to your chosen policy when the buffer is full
@@ -332,8 +331,7 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 }
 
 /*
- * TODO:
- * Implement consumer-side removal from the bounded buffer.
+ * Consumer-side removal from the bounded buffer.
  *
  * Requirements:
  *   - wait correctly while the buffer is empty
@@ -364,8 +362,7 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 }
 
 /*
- * TODO:
- * Implement the logging consumer thread.
+ * Logging consumer thread.
  *
  * Suggested responsibilities:
  *   - remove log chunks from the bounded buffer
