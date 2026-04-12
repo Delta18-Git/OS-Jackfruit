@@ -78,6 +78,7 @@ typedef struct container_record {
     char log_path[PATH_MAX];
     int stop_requested;
     int nice_value;
+    void *stack;
     struct container_record *next;
 } container_record_t;
 
@@ -629,6 +630,7 @@ static int spawn_container(supervisor_ctx_t *ctx, child_config_t *config)
     record->host_pid = pid;
     record->started_at = time(NULL);
     record->state = CONTAINER_RUNNING;
+    record->stack = stack;
 
     pthread_mutex_lock(&ctx->metadata_lock);
     record->next = ctx->containers;
@@ -928,6 +930,17 @@ static int run_supervisor(const char *rootfs)
     unlink(CONTROL_PATH);
     pthread_cancel(ipc_tid);
     pthread_join(ipc_tid, NULL);
+
+    pthread_mutex_lock(&ctx.metadata_lock);
+    container_record_t *rec = ctx.containers;
+    while (rec) {
+        container_record_t *next = rec->next;
+        free(rec->stack);
+        free(rec);
+        rec = next;
+    }
+    ctx.containers = NULL;
+    pthread_mutex_unlock(&ctx.metadata_lock);
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     pthread_join(ctx.logger_thread, NULL);
