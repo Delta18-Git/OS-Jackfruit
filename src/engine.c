@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -76,6 +77,7 @@ typedef struct container_record {
     int exit_signal;
     char log_path[PATH_MAX];
     int stop_requested;
+    int nice_value;
     struct container_record *next;
 } container_record_t;
 
@@ -239,6 +241,22 @@ static const char *state_to_string(container_state_t state)
     }
 }
 
+static long get_rss_kb(pid_t pid)
+{
+    char path[64], line[256];
+    FILE *f;
+    long rss_pages = 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/statm", pid);
+    f = fopen(path, "r");
+    if (f) {
+        if (fgets(line, sizeof(line), f))
+            sscanf(line, "%*s %ld", &rss_pages);
+        fclose(f);
+    }
+    return rss_pages * 4;
+}
+
 static int bounded_buffer_init(bounded_buffer_t *buffer)
 {
     int rc;
@@ -400,8 +418,7 @@ void *producer_thread_fn(void *arg)
 }
 
 /*
- * TODO:
- * Implement the clone child entrypoint.
+ * Clone child entrypoint.
  *
  * Required outcomes:
  *   - isolated PID / UTS / mount context
@@ -437,6 +454,13 @@ int child_fn(void *arg)
     if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
         perror("mount proc");
         return 1;
+    }
+
+    if (config->nice_value != 0) {
+        if (setpriority(PRIO_PROCESS, 0, config->nice_value) != 0) {
+            perror("setpriority");
+            return 1;
+        }
     }
 
     char *argv[64];
@@ -570,7 +594,7 @@ static int spawn_container(supervisor_ctx_t *ctx, child_config_t *config)
 
     int clone_flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
     pid_t pid = clone(child_fn, (char *)stack + STACK_SIZE, clone_flags, config);
-    
+
     close(pipefd[1]);
 
     if (pid < 0) {
@@ -616,6 +640,7 @@ static int spawn_container(supervisor_ctx_t *ctx, child_config_t *config)
 
     record->soft_limit_bytes = config->soft_limit_bytes;
     record->hard_limit_bytes = config->hard_limit_bytes;
+    record->nice_value = config->nice_value;
 
     if (ctx->monitor_fd >= 0) {
         register_with_monitor(ctx->monitor_fd, record->id, pid,
@@ -738,12 +763,13 @@ void *client_handler_thread_fn(void *arg) {
         char buf[1024];
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *curr = ctx->containers;
-        snprintf(buf, sizeof(buf), "%-16s %-8s %-16s %-8s\n", "CONTAINER ID", "PID", "STATE", "EXIT CODE");
+        snprintf(buf, sizeof(buf), "%-16s %-8s %-16s %-6s %-10s %-8s\n", "CONTAINER ID", "PID", "STATE", "NICE", "RSS(KB)", "EXIT CODE");
         send(client_fd, buf, strlen(buf), MSG_NOSIGNAL);
         while (curr) {
-            snprintf(buf, sizeof(buf), "%-16s %-8d %-16s %-8d\n",
+            snprintf(buf, sizeof(buf), "%-16s %-8d %-16s %-6d %-10ld %-8d\n",
                      curr->id, curr->host_pid, state_to_string(curr->state),
-                     (curr->state == CONTAINER_EXITED) ? curr->exit_code : 
+                     curr->nice_value, get_rss_kb(curr->host_pid),
+                     (curr->state == CONTAINER_EXITED) ? curr->exit_code :
                      ((curr->state == CONTAINER_KILLED || curr->state == CONTAINER_STOPPED) ? curr->exit_signal : 0));
             send(client_fd, buf, strlen(buf), MSG_NOSIGNAL);
             curr = curr->next;
@@ -752,7 +778,7 @@ void *client_handler_thread_fn(void *arg) {
     } else if (req.kind == CMD_LOGS) {
         resp.status = 0;
         send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
-        
+
         char log_path[PATH_MAX];
         snprintf(log_path, sizeof(log_path), "%s/%s.log", LOG_DIR, req.container_id);
         int fd = open(log_path, O_RDONLY);
@@ -975,7 +1001,7 @@ static int send_control_request(const control_request_t *req)
         if (errno == EINTR) continue;
         break;
     }
-    
+
     if (n < (ssize_t)sizeof(resp)) {
         fprintf(stderr, "Invalid response from supervisor\n");
         close(fd);
